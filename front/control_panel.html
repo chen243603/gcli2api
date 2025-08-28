@@ -768,7 +768,7 @@
     <div class="container">
         <!-- 登录界面 -->
         <div id="loginSection" class="login-form">
-            <h1>Google OAuth 认证管理</h1>
+            <h1>GCLI2API 管理面板</h1>
             <p>请输入访问密码：</p>
             <input type="password" id="loginPassword" placeholder="输入密码" onkeypress="handlePasswordEnter(event)" />
             <br>
@@ -777,7 +777,7 @@
 
         <!-- 主界面 -->
         <div id="mainSection" class="hidden">
-            <h1>Google OAuth 认证管理</h1>
+            <h1>GCLI2API 管理面板</h1>
             
             <!-- 标签页 -->
             <div class="tabs">
@@ -1242,6 +1242,22 @@ docker run -e GCLI_CREDS_1='{"client_id":"..."}' \
                         </div>
                         
                         <div class="config-group">
+                            <h4>兼容性配置</h4>
+                            
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="compatibilityModeEnabled" class="config-checkbox" />
+                                    启用兼容性模式
+                                </label>
+                                <small class="config-note">启用后所有system消息全部转换成user，停用system_instructions</small>
+                                <div class="config-info" style="background-color: #fff3cd; border: 1px solid #ffc107; color: #856404;">
+                                    <strong>⚠️ 注意：</strong>该选项可能会降低模型理解能力，但是能避免流式空回的情况。
+                                    <br><strong>适用场景：</strong>当遇到流式传输时模型不返回内容或返回空响应时启用此选项。
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="config-group">
                             <h4>抗截断配置</h4>
                             
                             <div class="form-group">
@@ -1258,6 +1274,57 @@ docker run -e GCLI_CREDS_1='{"client_id":"..."}' \
                                         <li>该功能仅在流式传输时生效</li>
                                         <li>例如: "gemini-2.5-pro-流式抗截断"</li>
                                     </ul>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="config-group">
+                            <h4>配置热更新说明</h4>
+                            
+                            <div class="form-group">
+                                <div class="config-info" style="background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724;">
+                                    <strong>🔥 热更新配置（立即生效）：</strong>
+                                    <ul style="margin: 8px 0; padding-left: 20px; color: #212529;">
+                                        <li><strong>网络配置：</strong>代理设置、HTTP超时时间、最大连接数</li>
+                                        <li><strong>API配置：</strong>凭证轮换次数、429重试设置、自动封禁配置</li>
+                                        <li><strong>密码配置：</strong>API密码、控制面板密码、通用密码</li>
+                                        <li><strong>日志级别：</strong>debug、info、warning、error、critical</li>
+                                        <li><strong>功能配置：</strong>抗截断最大重试次数</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            
+                            <div class="form-group">
+                                <div class="config-info" style="background-color: #fff3cd; border: 1px solid #ffc107; color: #856404;">
+                                    <strong>🔄 需要重启的配置：</strong>
+                                    <ul style="margin: 8px 0; padding-left: 20px; color: #212529;">
+                                        <li><strong>服务器配置：</strong>主机地址、端口号</li>
+                                        <li><strong>日志文件：</strong>日志文件路径</li>
+                                        <li><strong>目录配置：</strong>凭证目录路径、Code Assist端点</li>
+                                        <li><strong>内存监控：</strong>所有内存监控相关配置</li>
+                                    </ul>
+                                </div>
+                            </div>
+                            
+                            <div class="form-group">
+                                <div class="config-info" style="background-color: #e3f2fd; border: 1px solid #1976d2; color: #1565c0;">
+                                    <strong>💡 内存监控配置：</strong>
+                                    <div style="margin: 8px 0; color: #212529;">
+                                        内存监控功能默认关闭，需要通过环境变量启用：
+                                    </div>
+                                    <pre style="background: #f8f9fa; padding: 8px; border-radius: 4px; font-size: 11px; overflow-x: auto; margin: 8px 0;">
+# 启用内存监控
+AUTO_START_MEMORY_MONITOR=true
+
+# 内存限制配置 (可选)
+MAX_MEMORY_MB=100                    # 最大内存限制(MB)
+MEMORY_WARNING_THRESHOLD=0.9        # 警告阈值(90%)
+MEMORY_CRITICAL_THRESHOLD=0.95       # 清理阈值(95%)
+MEMORY_CHECK_INTERVAL=30            # 检查间隔(秒)</pre>
+
+                                    <div style="background: #f8d7da; border: 1px solid #f5c6cb; padding: 8px; margin-top: 10px; color: #721c24; border-radius: 4px;">
+                                        <strong>⚠️ 注意：</strong>内存监控配置需要<strong>重启服务器</strong>才能生效
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -2427,7 +2494,7 @@ docker run -e GCLI_CREDS_1='{"client_id":"..."}' \
             setConfigField('proxy', currentConfig.proxy || '');
             
             // 自动封禁配置
-            document.getElementById('autoBanEnabled').checked = currentConfig.auto_ban_enabled || false;
+            document.getElementById('autoBanEnabled').checked = Boolean(currentConfig.auto_ban_enabled);
             setConfigField('autoBanErrorCodes', (currentConfig.auto_ban_error_codes || []).join(','));
             
             // 性能配置
@@ -2436,13 +2503,16 @@ docker run -e GCLI_CREDS_1='{"client_id":"..."}' \
             setConfigField('maxConnections', currentConfig.max_connections || 100);
             
             // 429重试配置
-            document.getElementById('retry429Enabled').checked = currentConfig.retry_429_enabled || false;
+            document.getElementById('retry429Enabled').checked = Boolean(currentConfig.retry_429_enabled);
             setConfigField('retry429MaxRetries', currentConfig.retry_429_max_retries || 20);
             setConfigField('retry429Interval', currentConfig.retry_429_interval || 0.1);
             
             // 日志配置
             setConfigField('logLevel', currentConfig.log_level || 'info');
             setConfigField('logFile', currentConfig.log_file || 'log.txt');
+            
+            // 兼容性配置
+            document.getElementById('compatibilityModeEnabled').checked = Boolean(currentConfig.compatibility_mode_enabled);
             
             // 抗截断配置
             setConfigField('antiTruncationMaxAttempts', currentConfig.anti_truncation_max_attempts || 3);
@@ -2495,6 +2565,8 @@ docker run -e GCLI_CREDS_1='{"client_id":"..."}' \
                     // 日志配置
                     log_level: document.getElementById('logLevel').value || 'info',
                     log_file: document.getElementById('logFile').value.trim() || 'log.txt',
+                    // 兼容性配置
+                    compatibility_mode_enabled: document.getElementById('compatibilityModeEnabled').checked,
                     // 抗截断配置
                     anti_truncation_max_attempts: parseInt(document.getElementById('antiTruncationMaxAttempts').value) || 3
                 };
@@ -2508,7 +2580,21 @@ docker run -e GCLI_CREDS_1='{"client_id":"..."}' \
                 const data = await response.json();
 
                 if (response.ok) {
-                    showStatus('配置保存成功，已立即生效', 'success');
+                    let message = '配置保存成功';
+                    
+                    // 处理热更新状态信息
+                    if (data.hot_updated && data.hot_updated.length > 0) {
+                        message += `，以下配置已立即生效: ${data.hot_updated.join(', ')}`;
+                    }
+                    
+                    // 处理重启提醒
+                    if (data.restart_required && data.restart_required.length > 0) {
+                        message += `\n⚠️ 重启提醒: ${data.restart_notice}`;
+                        showStatus(message, 'info');
+                    } else {
+                        showStatus(message, 'success');
+                    }
+                    
                     // 重新加载配置以获取最新状态
                     setTimeout(() => loadConfig(), 1000);
                 } else {

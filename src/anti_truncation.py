@@ -4,27 +4,29 @@ Anti-Truncation Module - Ensures complete streaming output
 """
 import json
 from typing import Dict, Any, AsyncGenerator
+
 from fastapi.responses import StreamingResponse
 
 from log import log
+from .memory_manager import check_memory_limit
 
 # 反截断配置
 DONE_MARKER = "[done]"
 MAX_CONTINUATION_ATTEMPTS = 3
-CONTINUATION_PROMPT = """请从刚才被截断的地方继续输出剩余的所有内容。
+CONTINUATION_PROMPT = f"""请从刚才被截断的地方继续输出剩余的所有内容。
 
 重要提醒：
 1. 不要重复前面已经输出的内容
 2. 直接继续输出，无需任何前言或解释
-3. 当你完整完成所有内容输出后，必须在最后一行单独输出：[done]
-4. [done]标记表示你的回答已经完全结束，这是必需的结束标记
+3. 当你完整完成所有内容输出后，必须在最后一行单独输出：{DONE_MARKER}
+4. {DONE_MARKER} 标记表示你的回答已经完全结束，这是必需的结束标记
 
 现在请继续输出："""
 
 def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     对请求payload应用反截断处理
-    在systemInstruction中添加提醒，要求模型在结束时输出[done]标记
+    在systemInstruction中添加提醒，要求模型在结束时输出DONE_MARKER标记
     
     Args:
         payload: 原始请求payload
@@ -90,13 +92,18 @@ class AntiTruncationStreamProcessor:
         self.original_request_func = original_request_func
         self.base_payload = payload.copy()
         self.max_attempts = max_attempts
-        self.collected_content = ""
+        self.collected_content = []  # 使用列表避免字符串重复拼接
         self.current_attempt = 0
         
     async def process_stream(self) -> AsyncGenerator[bytes, None]:
         """处理流式响应，检测并处理截断"""
         
         while self.current_attempt < self.max_attempts:
+            # 在每次尝试前检查内存限制
+            if not check_memory_limit():
+                log.warning("内存压力过大，跳过反截断处理")
+                yield b'data: [DONE]\n\n'
+                return
             self.current_attempt += 1
             
             # 构建当前请求payload
@@ -166,8 +173,15 @@ class AntiTruncationStreamProcessor:
                         yield chunk
                         continue
                 
-                # 更新收集的内容
-                self.collected_content += chunk_content
+                # 更新收集的内容 - 使用列表避免字符串重复拼接
+                if chunk_content:
+                    self.collected_content.append(chunk_content)
+                    
+                    # 内存保护：如果收集的内容过多，强制结束
+                    if len(self.collected_content) > 100:  # 限制最大chunk数
+                        log.warning("反截断收集内容过多，强制结束以保护内存")
+                        yield b'data: [DONE]\n\n'
+                        return
                 
                 # 如果找到了done标记，结束
                 if found_done_marker:
@@ -175,15 +189,19 @@ class AntiTruncationStreamProcessor:
                     return
                 
                 # 最后再检查一次累积的内容（防止done标记跨chunk出现）
-                if self._check_done_marker_in_text(self.collected_content):
+                accumulated_text = ''.join(self.collected_content) if self.collected_content else ""
+                if self._check_done_marker_in_text(accumulated_text):
                     log.info("Anti-truncation: Found [done] marker in accumulated content")
                     yield b'data: [DONE]\n\n'
                     return
                 
                 # 如果没找到done标记且不是最后一次尝试，准备续传
                 if self.current_attempt < self.max_attempts:
-                    log.info(f"Anti-truncation: No [done] marker found in output (length: {len(self.collected_content)}), preparing continuation (attempt {self.current_attempt + 1})")
-                    log.debug(f"Anti-truncation: Current collected content ends with: {'...' + self.collected_content[-100:] if len(self.collected_content) > 100 else self.collected_content}")
+                    total_length = sum(len(chunk) for chunk in self.collected_content) if self.collected_content else 0
+                    log.info(f"Anti-truncation: No [done] marker found in output (length: {total_length}), preparing continuation (attempt {self.current_attempt + 1})")
+                    if self.collected_content and total_length > 100:
+                        last_chunk = self.collected_content[-1] if self.collected_content else ""
+                        log.debug(f"Anti-truncation: Current collected content ends with: {'...' + last_chunk[-100:]}")
                     # 在下一次循环中会继续
                     continue
                 else:
@@ -228,18 +246,21 @@ class AntiTruncationStreamProcessor:
         
         # 如果有收集到的内容，添加到对话中
         if self.collected_content:
-            # 添加模型的回复
+            # 拼接收集的内容并添加模型的回复
+            accumulated_text = ''.join(self.collected_content)
             new_contents.append({
                 "role": "model",
-                "parts": [{"text": self.collected_content}]
+                "parts": [{"text": accumulated_text}]
             })
         
         # 构建具体的续写指令，包含前面的内容摘要
         content_summary = ""
-        if len(self.collected_content) > 200:
-            content_summary = f"\n\n前面你已经输出了约 {len(self.collected_content)} 个字符的内容，结尾是：\n\"...{self.collected_content[-100:]}\""
-        elif self.collected_content:
-            content_summary = f"\n\n前面你已经输出的内容是：\n\"{self.collected_content}\""
+        if self.collected_content:
+            accumulated_text = ''.join(self.collected_content)
+            if len(accumulated_text) > 200:
+                content_summary = f"\n\n前面你已经输出了约 {len(accumulated_text)} 个字符的内容，结尾是：\n\"...{accumulated_text[-100:]}\""
+            else:
+                content_summary = f"\n\n前面你已经输出的内容是：\n\"{accumulated_text}\""
         
         detailed_continuation_prompt = f"""{CONTINUATION_PROMPT}{content_summary}"""
         
@@ -296,7 +317,8 @@ class AntiTruncationStreamProcessor:
             
             if not has_done_marker and self.current_attempt < self.max_attempts:
                 log.info("Anti-truncation: Non-streaming response needs continuation")
-                self.collected_content += text_content
+                if text_content:
+                    self.collected_content.append(text_content)
                 # 递归处理续传
                 return await self._handle_non_streaming_response(
                     await self.original_request_func(self._build_current_payload())
@@ -315,31 +337,12 @@ class AntiTruncationStreamProcessor:
             }).encode()
     
     def _check_done_marker_in_text(self, text: str) -> bool:
-        """检查文本中是否包含done标记（严格检测）"""
+        """检测文本中是否包含DONE_MARKER（只检测指定标记）"""
         if not text:
             return False
-        
-        # 支持的done标记变体
-        done_variants = [
-            "[done]",
-            "[DONE]", 
-            "[Done]",
-            "【done】",
-            "【DONE】",
-            "[完成]",
-            "[结束]"
-        ]
-        
-        # 分行检查，每行去掉空白后检查
-        lines = text.strip().split('\n')
-        for line in lines:
-            line_clean = line.strip()
-            # 检查整行是否就是done标记的任何变体
-            for variant in done_variants:
-                if line_clean == variant or line_clean.endswith(variant):
-                    return True
-        
-        return False
+
+        # 只要文本中出现DONE_MARKER即可
+        return DONE_MARKER in text
     
     def _check_done_marker_in_chunk_content(self, content: str) -> bool:
         """检查单个chunk内容中是否包含done标记"""

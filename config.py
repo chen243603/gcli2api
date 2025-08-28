@@ -21,6 +21,13 @@ AUTO_BAN_ENABLED = os.getenv("AUTO_BAN", "false").lower() in ("true", "1", "yes"
 # 需要自动封禁的错误码 (可通过环境变量 AUTO_BAN_ERROR_CODES 覆盖)
 AUTO_BAN_ERROR_CODES = [400, 403]
 
+# 内存管理配置
+MAX_MEMORY_MB = int(os.getenv("MAX_MEMORY_MB", "100"))  # 最大内存限制(MB)
+MEMORY_WARNING_THRESHOLD = float(os.getenv("MEMORY_WARNING_THRESHOLD", "0.90"))  # 警告阈值
+MEMORY_CRITICAL_THRESHOLD = float(os.getenv("MEMORY_CRITICAL_THRESHOLD", "0.95"))  # 临界阈值
+MEMORY_CHECK_INTERVAL = int(os.getenv("MEMORY_CHECK_INTERVAL", "30"))  # 检查间隔(秒)
+AUTO_START_MEMORY_MONITOR = os.getenv("AUTO_START_MEMORY_MONITOR", "false").lower() in ("true", "1", "yes", "on")
+
 # Default Safety Settings for Google API
 DEFAULT_SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -474,3 +481,20 @@ def get_auto_load_env_creds() -> bool:
         return env_value.lower() in ("true", "1", "yes", "on")
     
     return bool(get_config_value("auto_load_env_creds", False))
+
+def get_compatibility_mode_enabled() -> bool:
+    """
+    Get compatibility mode setting.
+    
+    兼容性模式：启用后所有system消息全部转换成user，停用system_instructions。
+    该选项可能会降低模型理解能力，但是能避免流式空回的情况。
+    
+    Environment variable: COMPATIBILITY_MODE
+    TOML config key: compatibility_mode_enabled
+    Default: True
+    """
+    env_value = os.getenv("COMPATIBILITY_MODE")
+    if env_value:
+        return env_value.lower() in ("true", "1", "yes", "on")
+    
+    return bool(get_config_value("compatibility_mode_enabled", True))

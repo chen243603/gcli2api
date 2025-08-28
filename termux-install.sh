@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# 避免交互式提示
+export DEBIAN_FRONTEND=noninteractive
+
 if [ "$(whoami)" = "root" ]; then
     echo "检测到root用户，正在退出..."
     exit
@@ -30,8 +33,29 @@ EOF
     echo "✅ 镜像源已更新为: $target_mirror"
 fi
 
+ensure_dpkg_ready() {
+    echo "检查并修复 dpkg/apt 状态..."
+    # 等待可能存在的 apt/dpkg 进程结束
+    if pgrep -f "apt|dpkg" >/dev/null 2>&1; then
+        echo "检测到 apt/dpkg 正在运行，等待其结束..."
+        while pgrep -f "apt|dpkg" >/dev/null 2>&1; do sleep 1; done
+    fi
+    # 清理可能残留的锁（若无进程）
+    for f in "$PREFIX/var/lib/dpkg/lock" \
+             "$PREFIX/var/lib/apt/lists/lock" \
+             "$PREFIX/var/cache/apt/archives/lock"; do
+        [ -e "$f" ] && rm -f "$f"
+    done
+    # 尝试继续未完成的配置
+    dpkg --configure -a || true
+}
+
+
 # 更新包列表
 echo "正在更新包列表..."
+# 更新包列表
+echo "正在更新包列表..."
+ensure_dpkg_ready
 apt update
 
 echo "✅ Termux镜像设置完成！"
@@ -70,9 +94,9 @@ fi
 # 如果需要安装软件，则更新包管理器并安装
 if [ "$need_update" = true ]; then
     echo "正在更新包管理器..."
-    pkg update && pkg upgrade -y
-    echo "正在安装缺失的软件包:$packages_to_install"
-    pkg install$packages_to_install -y
+    ensure_dpkg_ready
+    echo "正在安装缺失的软件包: $packages_to_install"
+    pkg install $packages_to_install -y
 else
     echo "所需软件包已全部安装，跳过更新和安装步骤"
 fi
@@ -98,8 +122,9 @@ else
     cd ./gcli2api
 fi
 
-echo "更新项目代码..."
-git pull
+echo "强制同步项目代码，忽略本地修改..."
+git fetch --all
+git reset --hard origin/$(git rev-parse --abbrev-ref HEAD)
 
 echo "初始化 uv 环境..."
 uv init

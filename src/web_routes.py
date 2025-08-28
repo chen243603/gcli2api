@@ -2,17 +2,26 @@
 Web路由模块 - 处理认证相关的HTTP请求和控制面板功能
 用于与上级web.py集成
 """
-import os
-from log import log
-import json
 import asyncio
+import datetime
+import glob
+import io
+import json
+import os
+import time
+from collections import deque
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+
+from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+from starlette.websockets import WebSocketState
+import toml
+import zipfile
 
+import config
+from log import log
 from .auth_api import (
     create_auth_url, get_auth_status,
     verify_password, generate_auth_token, verify_auth_token,
@@ -20,8 +29,7 @@ from .auth_api import (
     load_credentials_from_env, clear_env_credentials
 )
 from .credential_manager import CredentialManager
-from .usage_stats import get_usage_stats, get_aggregated_stats
-import config
+from .usage_stats import get_usage_stats, get_aggregated_stats, get_usage_stats_instance
 
 # 创建路由器
 router = APIRouter()
@@ -31,12 +39,19 @@ security = HTTPBearer()
 credential_manager = CredentialManager()
 
 # WebSocket连接管理
+
 class ConnectionManager:
-    def __init__(self, max_connections: int = 10):
-        self.active_connections: List[WebSocket] = []
+    def __init__(self, max_connections: int = 5):  # 降低最大连接数
+        # 使用弱引用和双端队列优化内存使用
+        self.active_connections: deque = deque(maxlen=max_connections)
         self.max_connections = max_connections
+        self._last_cleanup = 0
+        self._cleanup_interval = 30  # 30秒清理一次死连接
 
     async def connect(self, websocket: WebSocket):
+        # 自动清理死连接
+        self._auto_cleanup()
+        
         # 限制最大连接数，防止内存无限增长
         if len(self.active_connections) >= self.max_connections:
             await websocket.close(code=1008, reason="Too many connections")
@@ -48,8 +63,11 @@ class ConnectionManager:
         return True
 
     def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
+        # 使用更高效的方式移除连接
+        try:
             self.active_connections.remove(websocket)
+        except ValueError:
+            pass  # 连接已不存在
         log.debug(f"WebSocket连接断开，当前连接数: {len(self.active_connections)}")
 
     async def send_personal_message(self, message: str, websocket: WebSocket):
@@ -59,21 +77,64 @@ class ConnectionManager:
             self.disconnect(websocket)
 
     async def broadcast(self, message: str):
-        # 使用倒序遍历，安全地移除失效连接
-        for i in range(len(self.active_connections) - 1, -1, -1):
+        # 使用更高效的方式处理广播，避免索引操作
+        dead_connections = []
+        for conn in self.active_connections:
             try:
-                await self.active_connections[i].send_text(message)
+                await conn.send_text(message)
             except Exception:
-                self.active_connections.pop(i)
+                dead_connections.append(conn)
+        
+        # 批量移除死连接
+        for dead_conn in dead_connections:
+            self.disconnect(dead_conn)
                 
+    def _auto_cleanup(self):
+        """自动清理死连接"""
+        current_time = time.time()
+        if current_time - self._last_cleanup > self._cleanup_interval:
+            self.cleanup_dead_connections()
+            self._last_cleanup = current_time
+    
     def cleanup_dead_connections(self):
         """清理已断开的连接"""
-        self.active_connections = [
+        original_count = len(self.active_connections)
+        # 使用列表推导式过滤活跃连接，更高效
+        alive_connections = deque([
             conn for conn in self.active_connections 
-            if conn.client_state != WebSocketState.DISCONNECTED
-        ]
+            if hasattr(conn, 'client_state') and conn.client_state != WebSocketState.DISCONNECTED
+        ], maxlen=self.max_connections)
+        
+        self.active_connections = alive_connections
+        cleaned = original_count - len(self.active_connections)
+        if cleaned > 0:
+            log.debug(f"清理了 {cleaned} 个死连接，剩余连接数: {len(self.active_connections)}")
+    
+    def emergency_cleanup(self) -> dict[str, int]:
+        """紧急内存清理"""
+        log.warning("执行WebSocket连接管理器紧急内存清理")
+        cleaned = {'connections_cleared': 0}
+        
+        original_count = len(self.active_connections)
+        # 先尝试正常关闭连接
+        for conn in list(self.active_connections):
+            try:
+                if hasattr(conn, 'close') and conn.client_state != WebSocketState.DISCONNECTED:
+                    asyncio.create_task(conn.close())
+            except Exception:
+                pass
+        
+        self.active_connections.clear()
+        cleaned['connections_cleared'] = original_count
+        
+        log.info(f"WebSocket连接管理器紧急清理完成: {cleaned}")
+        return cleaned
 
 manager = ConnectionManager()
+
+# 注册WebSocket连接管理器到内存管理器
+from .memory_manager import register_cache_for_cleanup
+register_cache_for_cleanup("websocket_manager", manager)
 
 async def ensure_credential_manager_initialized():
     """确保credential manager已初始化"""
@@ -125,19 +186,55 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="无效的认证令牌")
     return credentials.credentials
 
+def is_mobile_user_agent(user_agent: str) -> bool:
+    """检测是否为移动设备用户代理"""
+    if not user_agent:
+        return False
+    
+    user_agent_lower = user_agent.lower()
+    mobile_keywords = [
+        'mobile', 'android', 'iphone', 'ipad', 'ipod', 
+        'blackberry', 'windows phone', 'samsung', 'htc',
+        'motorola', 'nokia', 'palm', 'webos', 'opera mini',
+        'opera mobi', 'fennec', 'minimo', 'symbian', 'psp',
+        'nintendo', 'tablet'
+    ]
+    
+    return any(keyword in user_agent_lower for keyword in mobile_keywords)
+
 @router.get("/", response_class=HTMLResponse)
 @router.get("/v1", response_class=HTMLResponse)
 @router.get("/auth", response_class=HTMLResponse)
-async def serve_control_panel():
+async def serve_control_panel(request: Request):
     """提供统一控制面板（包含认证、文件管理、配置等功能）"""
     try:
-        # 读取统一的控制面板HTML文件
-        html_file_path = "front/control_panel.html"
+        # 获取用户代理并判断是否为移动设备
+        user_agent = request.headers.get("user-agent", "")
+        is_mobile = is_mobile_user_agent(user_agent)
+        
+        # 根据设备类型选择相应的HTML文件
+        if is_mobile:
+            html_file_path = "front/control_panel_mobile.html"
+            log.info(f"Serving mobile control panel to user-agent: {user_agent}")
+        else:
+            html_file_path = "front/control_panel.html"
+            log.info(f"Serving desktop control panel to user-agent: {user_agent}")
+        
         with open(html_file_path, "r", encoding="utf-8") as f:
             html_content = f.read()
         return HTMLResponse(content=html_content)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="控制面板页面不存在")
+        log.error(f"控制面板页面文件不存在: {html_file_path}")
+        # 如果移动端文件不存在，回退到桌面版
+        if is_mobile:
+            try:
+                with open("front/control_panel.html", "r", encoding="utf-8") as f:
+                    html_content = f.read()
+                return HTMLResponse(content=html_content)
+            except FileNotFoundError:
+                raise HTTPException(status_code=404, detail="控制面板页面不存在")
+        else:
+            raise HTTPException(status_code=404, detail="控制面板页面不存在")
     except Exception as e:
         log.error(f"加载控制面板页面失败: {e}")
         raise HTTPException(status_code=500, detail="服务器内部错误")
@@ -607,7 +704,6 @@ async def refresh_all_user_emails(token: str = Depends(verify_token)):
         
         # 获取所有凭证文件
         from config import CREDENTIALS_DIR
-        import glob
         
         json_files = glob.glob(os.path.join(CREDENTIALS_DIR, "*.json"))
         
@@ -654,8 +750,6 @@ async def refresh_all_user_emails(token: str = Depends(verify_token)):
 async def download_all_creds(token: str = Depends(verify_token)):
     """打包下载所有凭证文件"""
     try:
-        import zipfile
-        import io
         from config import CREDENTIALS_DIR
         
         # 创建内存中的ZIP文件
@@ -670,8 +764,6 @@ async def download_all_creds(token: str = Depends(verify_token)):
                         zip_file.write(filepath, filename)
         
         zip_buffer.seek(0)
-        
-        from fastapi.responses import Response
         return Response(
             content=zip_buffer.getvalue(),
             media_type="application/zip",
@@ -690,8 +782,6 @@ async def get_config(token: str = Depends(verify_token)):
         await ensure_credential_manager_initialized()
         
         # 导入配置相关模块
-        import config
-        import toml
         
         # 读取当前配置（包括环境变量和TOML文件中的配置）
         current_config = {}
@@ -749,6 +839,9 @@ async def get_config(token: str = Depends(verify_token)):
         # 抗截断配置
         current_config["anti_truncation_max_attempts"] = config.get_anti_truncation_max_attempts()
         
+        # 兼容性配置
+        current_config["compatibility_mode_enabled"] = config.get_compatibility_mode_enabled()
+        
         # 服务器配置
         current_config["host"] = config.get_server_host()
         current_config["port"] = config.get_server_port()
@@ -769,6 +862,8 @@ async def get_config(token: str = Depends(verify_token)):
             env_locked.append("log_file")
         if os.getenv("ANTI_TRUNCATION_MAX_ATTEMPTS"):
             env_locked.append("anti_truncation_max_attempts")
+        if os.getenv("COMPATIBILITY_MODE"):
+            env_locked.append("compatibility_mode_enabled")
         if os.getenv("HOST"):
             env_locked.append("host")
         if os.getenv("PORT"):
@@ -795,10 +890,6 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
     """保存配置到TOML文件"""
     try:
         await ensure_credential_manager_initialized()
-        
-        import config
-        import toml
-        
         new_config = request.config
         
         log.info(f"收到的配置数据: {list(new_config.keys())}")
@@ -842,6 +933,10 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
         if "anti_truncation_max_attempts" in new_config:
             if not isinstance(new_config["anti_truncation_max_attempts"], int) or new_config["anti_truncation_max_attempts"] < 1 or new_config["anti_truncation_max_attempts"] > 10:
                 raise HTTPException(status_code=400, detail="抗截断最大重试次数必须是1-10之间的整数")
+        
+        if "compatibility_mode_enabled" in new_config:
+            if not isinstance(new_config["compatibility_mode_enabled"], bool):
+                raise HTTPException(status_code=400, detail="兼容性模式开关必须是布尔值")
         
         # 验证服务器配置
         if "host" in new_config:
@@ -897,6 +992,8 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
             env_locked_keys.add("log_file")
         if os.getenv("ANTI_TRUNCATION_MAX_ATTEMPTS"):
             env_locked_keys.add("anti_truncation_max_attempts")
+        if os.getenv("COMPATIBILITY_MODE"):
+            env_locked_keys.add("compatibility_mode_enabled")
         if os.getenv("HOST"):
             env_locked_keys.add("host")
         if os.getenv("PORT"):
@@ -932,37 +1029,109 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_to
         log.info(f"保存后立即读取的通用密码: {test_password}")
         
         # 热更新配置到内存中的模块（如果可能）
+        hot_updated = []  # 记录成功热更新的配置项
+        restart_required = []  # 记录需要重启的配置项
+        
+        # 支持热更新的配置项：
+        # - calls_per_rotation: 凭证轮换调用次数
+        # - proxy, http_timeout, max_connections: 网络配置
+        # - log_level: 日志级别
+        # - auto_ban_enabled, auto_ban_error_codes: 自动封禁配置
+        # - retry_429_enabled, retry_429_max_retries, retry_429_interval: 429重试配置
+        # - anti_truncation_max_attempts: 抗截断配置
+        # - compatibility_mode_enabled: 兼容性模式
+        # - api_password, panel_password, password: 访问密码
+        #
+        # 需要重启的配置项：
+        # - host, port: 服务器地址和端口
+        # - log_file: 日志文件路径
+        
         try:
             # save_config_to_toml已经更新了缓存，不需要reload
-            pass
             
-            # 更新credential_manager的配置
+            # 1. 更新credential_manager的配置
             if "calls_per_rotation" in new_config and "calls_per_rotation" not in env_locked_keys:
                 credential_manager._calls_per_rotation = new_config["calls_per_rotation"]
+                hot_updated.append("calls_per_rotation")
             
-            # 重新初始化HTTP客户端以应用新的代理配置（如果代理配置更改了）
-            if "proxy" in new_config and "proxy" not in env_locked_keys:
+            # 2. 重新初始化HTTP客户端以应用网络相关配置
+            network_configs_changed = any(key in new_config and key not in env_locked_keys 
+                                        for key in ["proxy", "http_timeout", "max_connections"])
+            
+            if network_configs_changed:
                 # 重新创建HTTP客户端
                 if credential_manager._http_client:
                     await credential_manager._http_client.aclose()
-                    proxy = config.get_proxy_config()
-                    client_kwargs = {
-                        "timeout": new_config.get("http_timeout", 30),
-                        "limits": __import__('httpx').Limits(
-                            max_keepalive_connections=20, 
-                            max_connections=new_config.get("max_connections", 100)
-                        )
-                    }
-                    if proxy:
-                        client_kwargs["proxy"] = proxy
-                    credential_manager._http_client = __import__('httpx').AsyncClient(**client_kwargs)
+                    
+                proxy = config.get_proxy_config()
+                client_kwargs = {
+                    "timeout": config.get_http_timeout(),
+                    "limits": __import__('httpx').Limits(
+                        max_keepalive_connections=20, 
+                        max_connections=config.get_max_connections()
+                    )
+                }
+                if proxy:
+                    client_kwargs["proxy"] = proxy
+                credential_manager._http_client = __import__('httpx').AsyncClient(**client_kwargs)
+                
+                # 记录热更新的网络配置
+                if "proxy" in new_config and "proxy" not in env_locked_keys:
+                    hot_updated.append("proxy")
+                if "http_timeout" in new_config and "http_timeout" not in env_locked_keys:
+                    hot_updated.append("http_timeout")
+                if "max_connections" in new_config and "max_connections" not in env_locked_keys:
+                    hot_updated.append("max_connections")
+            
+            # 3. 日志配置（部分热更新）
+            # 注意：日志级别可以热更新，但日志文件路径需要重启
+            if "log_level" in new_config and "log_level" not in env_locked_keys:
+                hot_updated.append("log_level")
+            
+            if "log_file" in new_config and "log_file" not in env_locked_keys:
+                restart_required.append("log_file")
+            
+            # 4. 其他可热更新的配置项
+            hot_updatable_configs = [
+                "auto_ban_enabled", "auto_ban_error_codes",
+                "retry_429_enabled", "retry_429_max_retries", "retry_429_interval",
+                "anti_truncation_max_attempts", "compatibility_mode_enabled"
+            ]
+            
+            for config_key in hot_updatable_configs:
+                if config_key in new_config and config_key not in env_locked_keys:
+                    hot_updated.append(config_key)
+            
+            # 5. 需要重启的配置项
+            restart_required_configs = ["host", "port"]
+            for config_key in restart_required_configs:
+                if config_key in new_config and config_key not in env_locked_keys:
+                    restart_required.append(config_key)
+            
+            # 6. 密码配置（立即生效）
+            password_configs = ["api_password", "panel_password", "password"]
+            for config_key in password_configs:
+                if config_key in new_config and config_key not in env_locked_keys:
+                    hot_updated.append(config_key)
+            
         except Exception as e:
             log.warning(f"热更新配置失败: {e}")
         
-        return JSONResponse(content={
+        # 构建响应消息
+        response_data = {
             "message": "配置保存成功",
             "saved_config": {k: v for k, v in new_config.items() if k not in env_locked_keys}
-        })
+        }
+        
+        # 添加热更新状态信息
+        if hot_updated:
+            response_data["hot_updated"] = hot_updated
+        
+        if restart_required:
+            response_data["restart_required"] = restart_required
+            response_data["restart_notice"] = f"以下配置项需要重启服务器才能生效: {', '.join(restart_required)}"
+        
+        return JSONResponse(content=response_data)
         
     except HTTPException:
         raise
@@ -1058,7 +1227,6 @@ async def get_env_creds_status(token: str = Depends(verify_token)):
 async def clear_logs(token: str = Depends(verify_token)):
     """清空日志文件"""
     try:
-        import config
         log_file_path = config.get_log_file()
         
         # 检查日志文件是否存在
@@ -1088,7 +1256,6 @@ async def clear_logs(token: str = Depends(verify_token)):
 async def download_logs(token: str = Depends(verify_token)):
     """下载日志文件"""
     try:
-        import config
         log_file_path = config.get_log_file()
         
         # 检查日志文件是否存在
@@ -1101,7 +1268,6 @@ async def download_logs(token: str = Depends(verify_token)):
             raise HTTPException(status_code=404, detail="日志文件为空")
         
         # 生成文件名（包含时间戳）
-        import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"gcli2api_logs_{timestamp}.txt"
         
@@ -1129,7 +1295,6 @@ async def websocket_logs(websocket: WebSocket):
     
     try:
         # 从配置获取日志文件路径
-        import config
         log_file_path = config.get_log_file()
         
         # 发送初始日志（限制为最后50行，减少内存占用）
@@ -1252,6 +1417,7 @@ async def get_aggregated_usage_statistics(token: str = Depends(verify_token)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 class UsageLimitsUpdateRequest(BaseModel):
     filename: str
     gemini_2_5_pro_limit: Optional[int] = None
@@ -1270,7 +1436,6 @@ async def update_usage_limits(request: UsageLimitsUpdateRequest, token: str = De
         Success message
     """
     try:
-        from .usage_stats import get_usage_stats_instance
         stats_instance = await get_usage_stats_instance()
         
         await stats_instance.update_daily_limits(
@@ -1305,7 +1470,6 @@ async def reset_usage_statistics(request: UsageResetRequest, token: str = Depend
         Success message
     """
     try:
-        from .usage_stats import get_usage_stats_instance
         stats_instance = await get_usage_stats_instance()
         
         await stats_instance.reset_stats(filename=request.filename)

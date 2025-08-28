@@ -8,16 +8,17 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, HTTPException, Depends, Request, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from .models import ChatCompletionRequest, ModelList, Model
-from .openai_transfer import openai_request_to_gemini, gemini_response_to_openai, gemini_stream_chunk_to_openai
-from .google_api_client import send_gemini_request, build_gemini_payload_from_openai
-from .credential_manager import CredentialManager
-from .anti_truncation import apply_anti_truncation_to_stream
 from config import get_available_models, is_fake_streaming_model, is_anti_truncation_model, get_base_model_from_feature_model, get_anti_truncation_max_attempts
 from log import log
+from .anti_truncation import apply_anti_truncation_to_stream
+from .credential_manager import CredentialManager
+from .google_api_client import send_gemini_request, build_gemini_payload_from_openai
+from .memory_manager import check_memory_limit, get_memory_usage
+from .models import ChatCompletionRequest, ModelList, Model
+from .openai_transfer import openai_request_to_gemini, gemini_response_to_openai, gemini_stream_chunk_to_openai
 
 # 创建路由器
 router = APIRouter()
@@ -56,6 +57,12 @@ async def chat_completions(
     credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     """处理OpenAI格式的聊天完成请求"""
+    # 内存检查
+    if not check_memory_limit():
+        memory_info = get_memory_usage()
+        log.error(f"内存使用过高，拒绝请求: {memory_info['rss_mb']:.1f}MB ({memory_info['usage_percent']*100:.1f}%)")
+        raise HTTPException(status_code=503, detail="服务器内存使用过高，请稍后重试")
+    
     token = authenticate(credentials)
     
     # 获取原始请求数据
