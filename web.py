@@ -1,11 +1,11 @@
 """
 Main Web Integration - Integrates all routers and modules
-根据修改指导要求，负责集合上述router并开启主服务
+集合router并开启主服务
 """
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 # Import all routers
@@ -93,6 +93,11 @@ app.include_router(
     tags=["Web Interface"]
 )
 
+# 保活接口（仅响应 HEAD）
+@app.head("/keepalive")
+async def keepalive() -> Response:
+    return Response(status_code=200)
+
 def get_credential_manager():
     """获取全局凭证管理器实例"""
     return global_credential_manager
@@ -111,8 +116,7 @@ if __name__ == "__main__":
     log.info("=" * 60)
     log.info("🚀 启动 GCLI2API")
     log.info("=" * 60)
-    log.info(f"📍 服务地址: http://127.0.0.1:{port}")
-    log.info(f"🔧 控制面板: http://127.0.0.1:{port}/auth")
+    log.info(f"🔧 控制面板: http://127.0.0.1:{port}")
     log.info("=" * 60)
     log.info("🔗 API端点:")
     log.info(f"   OpenAI兼容: http://127.0.0.1:{port}/v1")
